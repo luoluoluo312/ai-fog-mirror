@@ -103,6 +103,16 @@
   .tt{ font-size: 15px; font-weight: 600; letter-spacing: .2px; }
   .st{ font-size: 12.5px; color: var(--text-dim); margin-top: 3px; }
   .st b{ color: var(--accent-soft); font-weight: 600; }
+  /* 诊断读数：排查"检测不到手"用 */
+  .dbg{
+    font-size: 11px; margin-top: 4px; color: rgba(242, 245, 249, .42);
+    font-variant-numeric: tabular-nums; letter-spacing: .2px;
+  }
+
+  /* 移动端：GPU 性能有限，模糊半径必须降下来，否则识别会被拖到几乎不动 */
+  @media (max-width: 900px), (pointer: coarse){
+    #video{ filter: blur(18px) saturate(0.85) brightness(1.25) contrast(0.92); }
+  }
 
   /* 底部：进度 + 重置 */
   .bar{
@@ -189,6 +199,7 @@
       <div>
         <div class="tt">请在屏幕前捏合手指，开启除雾画笔</div>
         <div class="st" id="statusText">正在初始化摄像头…</div>
+        <div class="dbg" id="dbgText">—</div>
       </div>
     </div>
     <div class="panel bar">
@@ -253,6 +264,7 @@
   const card       = document.getElementById('card');
   const overlayText= document.getElementById('overlayText');
   const statusText = document.getElementById('statusText');
+  const dbgText    = document.getElementById('dbgText');
   const progressNum= document.getElementById('progressNum');
   const resetBtn   = document.getElementById('resetBtn');
   const brushRange = document.getElementById('brushRange');
@@ -270,6 +282,13 @@
   let tip         = null;    // 平滑后的指尖屏幕坐标 {x, y}
   let lastStamp   = null;    // 上一枚印章的位置（用于插值连线）
   let pinchScale  = 1;       // 捏合灵敏度倍率（底部「灵敏」滑杆，1 = 标准）
+
+  // 运行诊断计数（手机端排查"检测不到手"用）
+  let sentFrames = 0;        // 已送进模型的帧数
+  let sendErrors = 0;        // 送帧失败次数
+  let lastSendErr = '';      // 最近一次送帧错误
+  let handHits   = 0;        // 识别到手部的次数
+  const fpsWin   = { t: 0, n: 0, fps: 0 };
 
   /* =========================================================================
    * 3. 笔刷印章（预渲染成离屏画布，绘制时只做 drawImage，性能好）
@@ -482,6 +501,7 @@
     }
 
     handPresent = true;
+    handHits++;
     const lm = list[0];
     const thumbTip = lm[4];   // 大拇指尖
     const indexTip = lm[8];   // 食指尖
@@ -572,6 +592,7 @@
   }
   function refreshStatus() {
     if (!cameraReady) { setStatus('正在初始化摄像头…'); return; }
+    if (videoEl.paused) { setStatus('视频未播放 · <b>点一下画面</b> 唤醒摄像头'); return; }
     if (!handPresent)  { setStatus('未检测到手部 · 请把手掌放进画面'); return; }
     setStatus(pinching ? '已检测到手部 · <b>捏合中</b> ✏️ 除雾笔已落笔'
                        : '已检测到手部 · 松开（抬笔）');
@@ -582,7 +603,23 @@
     document.body.classList.toggle('is-hand',  handPresent);
     document.body.classList.toggle('is-pinch', handPresent && pinching);
   }
-  setInterval(syncHud, 200);
+
+  /** 诊断读数：能一眼看出是"视频没在走"还是"模型没收到帧"还是"就是没识别到手" */
+  function updateDebug() {
+    const now = performance.now();
+    if (fpsWin.t && now - fpsWin.t >= 1000) {
+      fpsWin.fps = Math.round(fpsWin.n * 1000 / (now - fpsWin.t));
+      fpsWin.t = now;
+      fpsWin.n = 0;
+    } else if (!fpsWin.t) {
+      fpsWin.t = now;
+    }
+    const vState = !videoEl.videoWidth ? '无信号' : (videoEl.paused ? '已暂停' : '播放中');
+    dbgText.textContent = '视频 ' + vState + ' · 识别 ' + fpsWin.fps + '/s · 送帧 ' + sentFrames +
+      ' · 检测到手 ' + handHits + (sendErrors ? ' · 送帧失败 ' + sendErrors + ' ' + lastSendErr : '');
+  }
+
+  setInterval(function () { syncHud(); updateDebug(); }, 500);
 
   /* =========================================================================
    * 11. 主帧循环（requestAnimationFrame）
@@ -689,8 +726,12 @@
     lastSend = now;
     try {
       await hands.send({ image: videoEl });
+      sentFrames++;
+      fpsWin.n++;
     } catch (e) {
-      /* 模型尚未就绪或单帧失败，忽略即可，下一帧继续 */
+      // 单帧失败不影响继续，但记录下来，手机上排查时能看到
+      sendErrors++;
+      lastSendErr = String((e && e.message) || e).slice(0, 48);
     }
   }
 
@@ -703,21 +744,27 @@
     hands.setOptions({
       maxNumHands: 1,               // 单笔刷，够用且更快
       modelComplexity: 0,           // 轻量模型，保证实时性
-      minDetectionConfidence: 0.6,
-      minTrackingConfidence: 0.55
+      minDetectionConfidence: 0.5,  // 用库默认值，收紧会让手机更难识别到
+      minTrackingConfidence: 0.5
     });
     hands.onResults(onResults);
     // 预加载 wasm + 模型；加超时，避免卡死在转圈界面
     await withTimeout(hands.initialize(), INIT_TIMEOUT, 'INIT_TIMEOUT');
   }
 
+  // 移动端用更低分辨率：720p 在手机上既拖慢推理也白耗电
+  const IS_TOUCH = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) ||
+                   (window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+  const CAM_W = IS_TOUCH ? 640 : 1280;
+  const CAM_H = IS_TOUCH ? 480 : 720;
+
   async function startCamera() {
     // 优先使用 MediaPipe Camera Utils（内部已处理 getUserMedia 与播放）
     if (typeof Camera !== 'undefined') {
       camera = new Camera(videoEl, {
         onFrame: pump,
-        width: 1280,
-        height: 720
+        width: CAM_W,
+        height: CAM_H
       });
       // Camera Utils 在取流失败时会弹 alert 阻塞页面，这里临时静音，改由下方统一报错
       const nativeAlert = window.alert;
@@ -727,12 +774,16 @@
       } finally {
         window.alert = nativeAlert;
       }
+      // 部分移动端浏览器会拦截自动播放，这里显式再叫一次（失败也不影响，点屏幕可兜底）
+      if (videoEl.paused) {
+        try { await videoEl.play(); } catch (e) { /* 需要用户手势，见下方点按兜底 */ }
+      }
       return;
     }
     // 兜底：Camera Utils 未加载时，自己驱动帧循环
     manualStream = await navigator.mediaDevices.getUserMedia({
       audio: false,
-      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
+      video: { facingMode: 'user', width: { ideal: CAM_W }, height: { ideal: CAM_H } }
     });
     videoEl.srcObject = manualStream;
     await videoEl.play();
@@ -800,6 +851,11 @@
   /* =========================================================================
    * 13. 交互：笔刷粗细 / 重置雾气
    * ====================================================================== */
+  // 移动端兜底：浏览器拦截自动播放时，点一下画面唤醒视频
+  stage.addEventListener('click', function () {
+    if (videoEl.paused) videoEl.play().catch(function () {});
+  });
+
   // 滑杆值 8~60 ⇒ 笔刷系数 0.008~0.060（默认 20 ⇒ 0.020）
   brushRange.addEventListener('input', function () {
     CFG.brushScale = Number(this.value) / 1000;
