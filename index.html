@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+<meta name="theme-color" content="#0b0e13" />
+<title>AI 隔空雾镜 · Fog Mirror</title>
+<style>
+  /* ===================== 基础布局 ===================== */
+  :root{
+    --accent: #ff8a3d;          /* 笔尖橙 */
+    --accent-soft: #ffc98a;
+    --panel-bg: rgba(18, 22, 30, 0.42);
+    --panel-line: rgba(255, 255, 255, 0.16);
+    --text: #f2f5f9;
+    --text-dim: rgba(242, 245, 249, 0.62);
+  }
+  *{ box-sizing: border-box; }
+  html, body{
+    margin: 0; padding: 0; height: 100%;
+    background: #0b0e13; color: var(--text);
+    overflow: hidden; overscroll-behavior: none; touch-action: none;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+                 "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  /* 舞台：所有图层都相对它定位 */
+  #stage{ position: fixed; inset: 0; }
+
+  /* 1) 底层摄像头画面：本身就是失焦的，对应"镜片后面的世界" */
+  #video{
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    object-fit: cover;
+    /* 镜像 + 微放大：放大是为了把模糊溢出到边缘的透明部分推出屏幕 */
+    transform: scaleX(-1) scale(1.12);
+    filter: blur(32px) saturate(0.85) brightness(1.25) contrast(0.92);
+    background: #0b0e13;
+  }
+
+  /* 2) 玻璃镜片：斜向反光 + 镜片压暗，压在失焦画面之上、雾气之下 */
+  #glass{
+    position: absolute; inset: 0; z-index: 1;
+    pointer-events: none;
+    background:
+      linear-gradient(112deg,
+        rgba(255,255,255,0.26) 0%,
+        rgba(255,255,255,0.07) 16%,
+        rgba(255,255,255,0.00) 32%),
+      linear-gradient(292deg,
+        rgba(255,255,255,0.16) 0%,
+        rgba(255,255,255,0.00) 26%),
+      radial-gradient(128% 100% at 50% 42%,
+        rgba(255,255,255,0.00) 42%,
+        rgba(150,176,210,0.26) 100%),
+      /* 玻璃常驻白罩：即使擦干净，画面也是隔着镜片看的 */
+      linear-gradient(rgba(255,255,255,0.16), rgba(255,255,255,0.16));
+  }
+
+  /* 3) 雾气层（附着在镜片上，可被擦除） */
+  #fog{
+    position: absolute; inset: 0;
+    width: 100%; height: 100%;
+    display: block;
+    z-index: 2;
+  }
+
+  /* ===================== HUD ===================== */
+  #hud{
+    position: absolute; inset: 0; z-index: 4;
+    pointer-events: none;             /* 默认不挡手势/画面 */
+    padding: max(18px, env(safe-area-inset-top)) 18px 18px;
+    display: flex; flex-direction: column;
+    justify-content: space-between; align-items: flex-start;
+    transition: opacity .5s ease;
+  }
+  .panel{
+    pointer-events: auto;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-line);
+    border-radius: 16px;
+    backdrop-filter: blur(14px) saturate(1.2);
+    -webkit-backdrop-filter: blur(14px) saturate(1.2);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, .28);
+  }
+
+  /* 左上：提示 + 状态 */
+  .hint{ display: flex; align-items: center; gap: 12px; padding: 12px 18px 12px 14px; }
+  .dot{
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #8b97a8; flex: none;
+    box-shadow: 0 0 0 0 rgba(255, 138, 61, .55);
+    transition: background .2s ease;
+  }
+  body.is-hand  .dot{ background: #57e08a; }
+  body.is-pinch .dot{ background: var(--accent); animation: pulse 1.25s ease-out infinite; }
+  @keyframes pulse{
+    0%  { box-shadow: 0 0 0 0 rgba(255, 138, 61, .55); }
+    100%{ box-shadow: 0 0 0 12px rgba(255, 138, 61, 0); }
+  }
+  .tt{ font-size: 15px; font-weight: 600; letter-spacing: .2px; }
+  .st{ font-size: 12.5px; color: var(--text-dim); margin-top: 3px; }
+  .st b{ color: var(--accent-soft); font-weight: 600; }
+
+  /* 底部：进度 + 重置 */
+  .bar{
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 9px 10px 9px 16px; align-self: flex-start;
+  }
+  /* 笔刷粗细滑杆 */
+  .ctl{ display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-dim); }
+  #brushRange{
+    -webkit-appearance: none; appearance: none;
+    width: 132px; height: 4px; border-radius: 2px;
+    background: rgba(255, 255, 255, .20); outline: none; cursor: pointer;
+  }
+  #brushRange::-webkit-slider-thumb{
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #fff; border: 2px solid var(--accent);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, .35);
+  }
+  #brushRange::-moz-range-thumb{
+    width: 14px; height: 14px; border-radius: 50%;
+    background: #fff; border: 2px solid var(--accent);
+  }
+  .bar .ratio{ font-size: 12.5px; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+  .bar .ratio b{ color: var(--text); font-weight: 600; }
+  #resetBtn{
+    font: inherit; font-size: 12.5px; color: var(--text);
+    background: rgba(255, 255, 255, .08);
+    border: 1px solid var(--panel-line);
+    border-radius: 10px; padding: 6px 12px; cursor: pointer;
+    transition: background .18s ease, transform .18s ease;
+  }
+  #resetBtn:hover{ background: rgba(255, 255, 255, .16); }
+  #resetBtn:active{ transform: scale(.96); }
+
+  /* ===================== 加载 / 错误遮罩 ===================== */
+  #overlay{
+    position: absolute; inset: 0; z-index: 9;
+    display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(120% 90% at 50% 40%, #1a2130 0%, #0b0e13 70%);
+    transition: opacity .55s ease, visibility .55s ease;
+  }
+  #overlay.hidden{ opacity: 0; visibility: hidden; pointer-events: none; }
+  .card{ max-width: 460px; padding: 26px 30px; text-align: center; }
+  .card h1{ margin: 0 0 6px; font-size: 19px; letter-spacing: .4px; }
+  .card p{ margin: 0; font-size: 13.5px; line-height: 1.75; color: var(--text-dim); }
+  .card code{
+    background: rgba(255,255,255,.08); border-radius: 6px;
+    padding: 1px 6px; font-size: 12.5px; color: var(--accent-soft);
+  }
+  .spinner{
+    width: 34px; height: 34px; margin: 0 auto 18px;
+    border: 2.5px solid rgba(255,255,255,.14);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .9s linear infinite;
+  }
+  @keyframes spin{ to{ transform: rotate(360deg); } }
+  .card.error .spinner{ animation: none; border-color: rgba(255,90,90,.5); border-top-color: #ff5a5a; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <!-- 底层：摄像头 -->
+  <video id="video" playsinline autoplay muted></video>
+  <!-- 玻璃镜片的反光层 -->
+  <div id="glass"></div>
+  <!-- 中层：附着在镜片上的雾气（可被擦除） -->
+  <canvas id="fog"></canvas>
+
+  <!-- 悬浮 UI -->
+  <div id="hud">
+    <div class="panel hint">
+      <span class="dot" id="dot"></span>
+      <div>
+        <div class="tt">请在屏幕前捏合手指，开启除雾画笔</div>
+        <div class="st" id="statusText">正在初始化摄像头…</div>
+      </div>
+    </div>
+    <div class="panel bar">
+      <label class="ctl">笔刷
+        <input id="brushRange" type="range" min="8" max="60" step="1" value="20" />
+      </label>
+      <span class="ratio">已除雾 <b id="progressNum">0%</b></span>
+      <button id="resetBtn" type="button">重置雾气</button>
+    </div>
+  </div>
+
+  <!-- 加载 / 报错 -->
+  <div id="overlay">
+    <div class="card" id="card">
+      <div class="spinner"></div>
+      <h1>正在准备隔空雾镜…</h1>
+      <p id="overlayText">加载手部识别模型，请允许使用摄像头。</p>
+    </div>
+  </div>
+</div>
+
+<!-- MediaPipe Hands + Camera Utils（CDN） -->
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+<script>
+(function () {
+  'use strict';
+
+  /* =========================================================================
+   * 0. 常量与可调参数
+   * ====================================================================== */
+  const CFG = {
+    // —— 笔刷 ——
+    brushScale: 0.020,      // 笔刷半径 = min(屏宽,屏高) * brushScale（越小笔迹越细）
+    brushStrength: 0.5,     // 单枚笔刷印章的不透明度（决定擦除速度）
+    stampSpacing: 0.25,     // 印章间距 = 半径 * stampSpacing（越大越快、越省）
+    haloScale: 2.8,         // 外圈柔化笔刷直径相对笔刷半径（羽化范围）
+
+    // —— 捏合判定 ——
+    pinchClose: 0.055,      // 指尖归一化距离 < 此值 ⇒ 捏合（落笔）
+    pinchOpen: 0.075,       // 指尖归一化距离 > 此值 ⇒ 松开（抬笔）—— 滞回防抖
+
+    // —— 平滑 / 性能 ——
+    smoothing: 0.45,        // 指尖坐标指数平滑系数（越小越顺滑、越滞后）
+    minMove: 0.8,           // 位移小于该像素值不落笔（抑制抖动）
+    maxJump: 3.0,           // 单帧位移超过 半径*maxJump 视为跳变，断开笔画
+    detectFPS: 30,          // 手势识别帧率（渲染仍为 60fps）
+    maxDPR: 2               // 像素比上限，避免 4K 屏下画布过大
+  };
+
+  /* =========================================================================
+   * 1. DOM 与画布初始化
+   * ====================================================================== */
+  const stage      = document.getElementById('stage');
+  const videoEl    = document.getElementById('video');
+  const fogCanvas  = document.getElementById('fog');
+  const overlay    = document.getElementById('overlay');
+  const card       = document.getElementById('card');
+  const overlayText= document.getElementById('overlayText');
+  const statusText = document.getElementById('statusText');
+  const progressNum= document.getElementById('progressNum');
+  const resetBtn   = document.getElementById('resetBtn');
+  const brushRange = document.getElementById('brushRange');
+
+  const fctx = fogCanvas.getContext('2d');               // 雾气层
+
+  let W = 1, H = 1, DPR = 1;                             // CSS 像素尺寸 + 像素比
+
+  /* =========================================================================
+   * 2. 手部状态
+   * ====================================================================== */
+  let handPresent = false;   // 是否检测到手
+  let pinching    = false;   // 是否处于捏合（落笔）状态
+  let tip         = null;    // 平滑后的指尖屏幕坐标 {x, y}
+  let lastStamp   = null;    // 上一枚印章的位置（用于插值连线）
+
+  /* =========================================================================
+   * 3. 笔刷印章（预渲染成离屏画布，绘制时只做 drawImage，性能好）
+   * ====================================================================== */
+  const brush = { r: 60, core: null, halo: null };
+
+  /** 生成一个径向渐变圆点贴图：中心不透明 → 边缘透明 */
+  function makeRadialSprite(size, stops) {
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d');
+    const grd = g.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    for (const [pos, color] of stops) grd.addColorStop(pos, color);
+    g.fillStyle = grd;
+    g.fillRect(0, 0, size, size);
+    return c;
+  }
+
+  function buildBrush() {
+    // 主笔刷：中间实、外圈快速衰减 —— 保证笔迹中心擦得干净
+    brush.core = makeRadialSprite(256, [
+      [0.00, 'rgba(0,0,0,1)'],
+      [0.35, 'rgba(0,0,0,1)'],
+      [0.62, 'rgba(0,0,0,0.55)'],
+      [0.85, 'rgba(0,0,0,0.12)'],
+      [1.00, 'rgba(0,0,0,0)']
+    ]);
+
+    // 外圈笔刷：很淡、很大 —— 让雾边自然羽化，避免生硬圆边
+    brush.halo = makeRadialSprite(128, [
+      [0.00, 'rgba(0,0,0,0.32)'],
+      [0.55, 'rgba(0,0,0,0.10)'],
+      [1.00, 'rgba(0,0,0,0)']
+    ]);
+
+    updateBrushRadius();
+  }
+
+  /** 只按当前视口与笔刷系数换算半径（拖滑杆时走这里，不重建贴图） */
+  function updateBrushRadius() {
+    brush.r = Math.max(4, Math.min(W, H) * CFG.brushScale);
+  }
+
+  /* =========================================================================
+   * 4. 雾气绘制：磨砂白雾（云团 + 冷调暗角 + 噪点）
+   * ====================================================================== */
+  let noisePattern = null;
+  let baseAlpha = 1;               // 初始雾气不透明度，用于换算除雾进度
+  let clouds = [];
+
+  /** 生成一张可平铺的磨砂噪点贴图 */
+  function buildNoise() {
+    const size = 160;
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const g = c.getContext('2d');
+    const img = g.createImageData(size, size);
+    const d = img.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const v = 120 + Math.random() * 135;   // 灰阶噪点
+      d[i] = d[i + 1] = d[i + 2] = v;
+      d[i + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+    noisePattern = fctx.createPattern(c, 'repeat');
+  }
+
+  /** 重新绘制整层雾气（初始化 / 窗口尺寸变化 / 点击重置时调用） */
+  function paintFog() {
+    // 随机云团：营造雾气浓淡不均的通透感
+    clouds = [];
+    for (let i = 0; i < 13; i++) {
+      clouds.push({
+        x: Math.random(),
+        y: Math.random(),
+        r: 0.22 + Math.random() * 0.55,       // 相对 max(W,H) 的半径
+        a: 0.06 + Math.random() * 0.14
+      });
+    }
+
+    fctx.globalCompositeOperation = 'source-over';
+    fctx.globalAlpha = 1;
+    fctx.clearRect(0, 0, W, H);
+
+    // (1) 基础白雾：厚雾，只见人影轮廓、不见细节
+    fctx.fillStyle = 'rgba(244,248,252,0.75)';
+    fctx.fillRect(0, 0, W, H);
+
+    // (2) 白色云团：径向渐变的柔和高光
+    const maxSide = Math.max(W, H);
+    for (const c of clouds) {
+      const cx = c.x * W, cy = c.y * H, r = c.r * maxSide;
+      const grd = fctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+      grd.addColorStop(0.0, 'rgba(255,255,255,' + c.a.toFixed(3) + ')');
+      grd.addColorStop(0.55, 'rgba(255,255,255,' + (c.a * 0.5).toFixed(3) + ')');
+      grd.addColorStop(1.0, 'rgba(255,255,255,0)');
+      fctx.fillStyle = grd;
+      fctx.fillRect(0, 0, W, H);
+    }
+
+    // (3) 冷调暗角：玻璃边缘的青灰，让雾有厚度
+    const vg = fctx.createRadialGradient(
+      W * 0.5, H * 0.45, Math.min(W, H) * 0.20,
+      W * 0.5, H * 0.50, Math.max(W, H) * 0.78
+    );
+    vg.addColorStop(0, 'rgba(255,255,255,0)');
+    vg.addColorStop(1, 'rgba(176,196,220,0.10)');
+    fctx.fillStyle = vg;
+    fctx.fillRect(0, 0, W, H);
+
+    // (4) 磨砂噪点
+    if (noisePattern) {
+      fctx.globalAlpha = 0.06;
+      fctx.fillStyle = noisePattern;
+      fctx.fillRect(0, 0, W, H);
+      fctx.globalAlpha = 1;
+    }
+
+    baseAlpha = Math.max(0.05, sampleAlpha());   // 记录基线用于进度换算
+  }
+
+  /* =========================================================================
+   * 5. 尺寸自适应
+   * ====================================================================== */
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, CFG.maxDPR);
+    W = Math.max(1, stage.clientWidth);
+    H = Math.max(1, stage.clientHeight);
+
+    fogCanvas.width  = Math.round(W * DPR);
+    fogCanvas.height = Math.round(H * DPR);
+    // 设置尺寸会重置上下文状态，需重新应用缩放，之后所有绘制都用 CSS 像素坐标
+    fctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+    buildBrush();
+    buildNoise();
+    paintFog();
+
+    lastStamp = null;
+    updateProgress(0);
+  }
+
+  let resizeTimer = 0;
+  function onResize() {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(resize, 150);   // 去抖：重绘雾气有一定开销
+  }
+  window.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', onResize);
+
+  /* =========================================================================
+   * 6. 坐标映射：MediaPipe 归一化坐标 → 屏幕坐标（含镜像与 cover 裁剪）
+   * ====================================================================== */
+  function toScreen(nx, ny) {
+    const vw = videoEl.videoWidth  || 1280;
+    const vh = videoEl.videoHeight || 720;
+
+    // 与 CSS object-fit: cover 完全一致的缩放与居中裁剪
+    const scale = Math.max(W / vw, H / vh);
+    const dw = vw * scale, dh = vh * scale;
+    const ox = (W - dw) / 2, oy = (H - dh) / 2;
+
+    // 画面被 scaleX(-1) 镜像，因此 x 需要关于屏幕中线翻转
+    return { x: W - (ox + nx * dw), y: oy + ny * dh };
+  }
+
+  /* =========================================================================
+   * 7. 擦除：沿两点之间插值盖印章
+   * ====================================================================== */
+  function stamp(dx, dy, sprite, size, alpha) {
+    fctx.globalAlpha = alpha;
+    fctx.drawImage(sprite, dx - size / 2, dy - size / 2, size, size);
+  }
+
+  function eraseSegment(a, b) {
+    const R = brush.r;
+    const dist = Math.hypot(b.x - a.x, b.y - a.y);
+    const step = Math.max(2, R * CFG.stampSpacing);
+    const n = Math.max(1, Math.round(dist / step));
+
+    fctx.globalCompositeOperation = 'destination-out';   // 关键：挖洞
+
+    for (let i = 0; i <= n; i++) {
+      const t = i / n;
+      const x = a.x + (b.x - a.x) * t;
+      const y = a.y + (b.y - a.y) * t;
+      // 外圈先铺一层很淡的羽化，再压上核心，得到柔和的雾边
+      stamp(x, y, brush.halo, R * CFG.haloScale, CFG.brushStrength * 0.45);
+      stamp(x, y, brush.core, R * 2,             CFG.brushStrength);
+    }
+
+    fctx.globalAlpha = 1;
+    fctx.globalCompositeOperation = 'source-over';
+  }
+
+  /* =========================================================================
+   * 8. MediaPipe 结果回调：捏合判定 + 落笔
+   * ====================================================================== */
+  function onResults(results) {
+    const list = results.multiHandLandmarks;
+
+    // —— 没有手：抬笔复位 ——
+    if (!list || list.length === 0) {
+      handPresent = false;
+      pinching = false;
+      tip = null;
+      lastStamp = null;
+      return;
+    }
+
+    handPresent = true;
+    const lm = list[0];
+    const thumbTip = lm[4];   // 大拇指尖
+    const indexTip = lm[8];   // 食指尖
+
+    // —— 指尖坐标：两点中点，做指数平滑去抖 ——
+    const mid = toScreen((thumbTip.x + indexTip.x) / 2, (thumbTip.y + indexTip.y) / 2);
+    if (!tip) {
+      tip = mid;                                  // 首次出现，直接吸附（避免长距离拖影）
+      lastStamp = null;
+    } else {
+      tip.x += (mid.x - tip.x) * CFG.smoothing;
+      tip.y += (mid.y - tip.y) * CFG.smoothing;
+    }
+
+    // —— 捏合判定：归一化欧氏距离 + 滞回，避免在阈值附近抖动 ——
+    const pinchDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
+    if (!pinching && pinchDist < CFG.pinchClose)      pinching = true;
+    else if (pinching && pinchDist > CFG.pinchOpen)   pinching = false;
+
+    if (pinching) drawStroke();
+    else          lastStamp = null;                // 抬笔：断开笔画，下次重新起笔
+  }
+
+  /** 落笔：把当前指尖位置连到上一枚印章 */
+  function drawStroke() {
+    if (!lastStamp) {
+      // 起笔：先点一个圆点
+      fctx.globalCompositeOperation = 'destination-out';
+      stamp(tip.x, tip.y, brush.halo, brush.r * CFG.haloScale, CFG.brushStrength * 0.45);
+      stamp(tip.x, tip.y, brush.core, brush.r * 2,             CFG.brushStrength);
+      fctx.globalAlpha = 1;
+      fctx.globalCompositeOperation = 'source-over';
+      lastStamp = { x: tip.x, y: tip.y };
+    } else {
+      const d = Math.hypot(tip.x - lastStamp.x, tip.y - lastStamp.y);
+      if (d < CFG.minMove) return;                            // 原地抖动：忽略
+      if (d > brush.r * CFG.maxJump) {                        // 跳变：断开重连
+        lastStamp = { x: tip.x, y: tip.y };
+        return;
+      }
+      eraseSegment(lastStamp, tip);
+      lastStamp = { x: tip.x, y: tip.y };
+    }
+  }
+
+  /* =========================================================================
+   * 9. 除雾进度（低分辨率采样，成本极低）
+   * ====================================================================== */
+  const mini = document.createElement('canvas');
+  mini.width = 80; mini.height = 45;
+  const mctx = mini.getContext('2d', { willReadFrequently: true });
+
+  function sampleAlpha() {
+    mctx.clearRect(0, 0, 80, 45);
+    mctx.drawImage(fogCanvas, 0, 0, 80, 45);
+    const d = mctx.getImageData(0, 0, 80, 45).data;
+    let sum = 0;
+    for (let i = 3; i < d.length; i += 4) sum += d[i];
+    return sum / (d.length / 4) / 255;
+  }
+
+  let lastProgress = 0;
+  function updateProgress(ratio) {
+    const pct = Math.round(Math.max(0, Math.min(1, ratio)) * 100);
+    if (pct === lastProgress) return;
+    lastProgress = pct;
+    progressNum.textContent = pct + '%';
+  }
+
+  let nextProgressAt = 0;
+  function tickProgress(now) {
+    if (!pinching || now < nextProgressAt) return;
+    nextProgressAt = now + 600;
+    updateProgress(1 - sampleAlpha() / baseAlpha);
+  }
+
+  /* =========================================================================
+   * 10. 状态文案
+   * ====================================================================== */
+  let lastStatus = '';
+  function setStatus(html) {
+    if (html === lastStatus) return;
+    lastStatus = html;
+    statusText.innerHTML = html;
+  }
+  function refreshStatus() {
+    if (!cameraReady) { setStatus('正在初始化摄像头…'); return; }
+    if (!handPresent)  { setStatus('未检测到手部 · 请把手掌放进画面'); return; }
+    setStatus(pinching ? '已检测到手部 · <b>捏合中</b> ✏️ 除雾笔已落笔'
+                       : '已检测到手部 · 松开（抬笔）');
+  }
+  setInterval(function () {
+    refreshStatus();
+    document.body.classList.toggle('is-hand',  handPresent);
+    document.body.classList.toggle('is-pinch', handPresent && pinching);
+  }, 120);
+
+  /* =========================================================================
+   * 11. 主帧循环（requestAnimationFrame）
+   * ====================================================================== */
+  function loop(now) {
+    requestAnimationFrame(loop);
+    tickProgress(now);
+  }
+
+  /* =========================================================================
+   * 12. 摄像头 + 手部识别管线
+   * ====================================================================== */
+  let cameraReady = false;
+  let hands = null;
+  let camera = null;
+  let manualStream = null;
+
+  function showError(title, message) {
+    card.classList.add('error');
+    card.innerHTML = '<div class="spinner"></div><h1>' + title + '</h1><p>' + message + '</p>';
+    overlay.classList.remove('hidden');
+  }
+
+  function hideOverlay() {
+    overlay.classList.add('hidden');
+  }
+
+  /** 按固定帧率把手部画面送进 MediaPipe（识别 30fps，渲染 60fps） */
+  let lastSend = 0;
+  async function pump() {
+    const now = performance.now();
+    if (now - lastSend < 1000 / CFG.detectFPS) return;
+    if (!videoEl.videoWidth || videoEl.readyState < 2) return;
+    lastSend = now;
+    try {
+      await hands.send({ image: videoEl });
+    } catch (e) {
+      /* 模型尚未就绪或单帧失败，忽略即可，下一帧继续 */
+    }
+  }
+
+  async function initHands() {
+    if (typeof Hands === 'undefined') {
+      throw new Error('MediaPipe Hands 脚本未加载，请检查网络或 CDN 是否可用。');
+    }
+    hands = new Hands({
+      locateFile: function (file) {
+        return 'https://cdn.jsdelivr.net/npm/@mediapipe/hands/' + file;
+      }
+    });
+    hands.setOptions({
+      maxNumHands: 1,               // 单笔刷，够用且更快
+      modelComplexity: 0,           // 轻量模型，保证实时性
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence: 0.55
+    });
+    hands.onResults(onResults);
+    await hands.initialize();       // 预加载 wasm + 模型
+  }
+
+  async function startCamera() {
+    // 优先使用 MediaPipe Camera Utils（内部已处理 getUserMedia 与播放）
+    if (typeof Camera !== 'undefined') {
+      camera = new Camera(videoEl, {
+        onFrame: pump,
+        width: 1280,
+        height: 720
+      });
+      // Camera Utils 在取流失败时会弹 alert 阻塞页面，这里临时静音，改由下方统一报错
+      const nativeAlert = window.alert;
+      window.alert = function () {};
+      try {
+        await camera.start();
+      } finally {
+        window.alert = nativeAlert;
+      }
+      return;
+    }
+    // 兜底：Camera Utils 未加载时，自己驱动帧循环
+    manualStream = await navigator.mediaDevices.getUserMedia({
+      audio: false,
+      video: { facingMode: 'user', width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    videoEl.srcObject = manualStream;
+    await videoEl.play();
+    (function manualLoop() {
+      requestAnimationFrame(manualLoop);
+      pump();
+    })();
+  }
+
+  async function boot() {
+    resize();
+    requestAnimationFrame(loop);
+
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('NO_CAMERA_API');
+      }
+      await initHands();
+      overlayText.textContent = '模型就绪，正在开启摄像头…';
+      await startCamera();
+
+      cameraReady = true;
+      refreshStatus();
+      hideOverlay();
+    } catch (err) {
+      console.error(err);
+      const isSecure = window.isSecureContext;
+      const isFile = location.protocol === 'file:';
+      let title = '启动失败';
+      let msg = String((err && err.message) || err);
+
+      if (err && err.message === 'NO_CAMERA_API' || (err && err.name === 'NotAllowedError')) {
+        title = '无法访问摄像头';
+        msg = '请检查浏览器权限设置，允许本站使用摄像头后刷新页面。';
+      } else if (err && err.name === 'NotFoundError') {
+        title = '未找到摄像头';
+        msg = '请确认设备已连接摄像头（或已开启虚拟摄像头）后刷新页面。';
+      }
+
+      if (!isSecure || isFile) {
+        title = '需要通过本地服务打开';
+        msg = '浏览器要求安全上下文（https 或 localhost）才能调用摄像头。' +
+              '<br><br>请在本文件所在目录执行：<br>' +
+              '<code>python -m http.server 8000</code><br><br>' +
+              '然后访问 <code>http://localhost:8000/index.html</code>';
+      }
+      showError(title, msg);
+    }
+  }
+
+  /* =========================================================================
+   * 13. 交互：笔刷粗细 / 重置雾气
+   * ====================================================================== */
+  // 滑杆值 8~60 ⇒ 笔刷系数 0.008~0.060（默认 20 ⇒ 0.020）
+  brushRange.addEventListener('input', function () {
+    CFG.brushScale = Number(this.value) / 1000;
+    updateBrushRadius();
+  });
+
+  resetBtn.addEventListener('click', function () {
+    lastStamp = null;
+    paintFog();
+    updateProgress(0);
+  });
+
+  /* =========================================================================
+   * 14. 启动
+   * ====================================================================== */
+  boot();
+})();
+</script>
+</body>
+</html>
