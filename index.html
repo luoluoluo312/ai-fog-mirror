@@ -111,18 +111,18 @@
   }
   /* 笔刷粗细滑杆 */
   .ctl{ display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-dim); }
-  #brushRange{
+  #brushRange, #sensRange{
     -webkit-appearance: none; appearance: none;
     width: 132px; height: 4px; border-radius: 2px;
     background: rgba(255, 255, 255, .20); outline: none; cursor: pointer;
   }
-  #brushRange::-webkit-slider-thumb{
+  #brushRange::-webkit-slider-thumb, #sensRange::-webkit-slider-thumb{
     -webkit-appearance: none; appearance: none;
     width: 14px; height: 14px; border-radius: 50%;
     background: #fff; border: 2px solid var(--accent);
     box-shadow: 0 2px 6px rgba(0, 0, 0, .35);
   }
-  #brushRange::-moz-range-thumb{
+  #brushRange::-moz-range-thumb, #sensRange::-moz-range-thumb{
     width: 14px; height: 14px; border-radius: 50%;
     background: #fff; border: 2px solid var(--accent);
   }
@@ -137,6 +137,14 @@
   }
   #resetBtn:hover{ background: rgba(255, 255, 255, .16); }
   #resetBtn:active{ transform: scale(.96); }
+  #retryBtn{
+    font: inherit; font-size: 13px; color: #fff; margin-top: 20px;
+    background: rgba(255, 255, 255, .10);
+    border: 1px solid var(--panel-line);
+    border-radius: 10px; padding: 8px 22px; cursor: pointer;
+    transition: background .18s ease;
+  }
+  #retryBtn:hover{ background: rgba(255, 255, 255, .18); }
 
   /* ===================== 加载 / 错误遮罩 ===================== */
   #overlay{
@@ -187,6 +195,9 @@
       <label class="ctl">笔刷
         <input id="brushRange" type="range" min="8" max="60" step="1" value="20" />
       </label>
+      <label class="ctl">灵敏
+        <input id="sensRange" type="range" min="60" max="200" step="5" value="100" />
+      </label>
       <span class="ratio">已除雾 <b id="progressNum">0%</b></span>
       <button id="resetBtn" type="button">重置雾气</button>
     </div>
@@ -202,9 +213,9 @@
   </div>
 </div>
 
-<!-- MediaPipe Hands + Camera Utils（CDN） -->
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+<!-- MediaPipe Hands + Camera Utils 由脚本动态加载（见 loadMediaPipe）。
+     这里刻意不用静态 <script src>：CDN 一旦连不上，静态标签会阻塞整个页面解析，
+     表现就是永远转圈、连报错都弹不出来。 -->
 
 <script>
 (function () {
@@ -221,8 +232,8 @@
     haloScale: 2.8,         // 外圈柔化笔刷直径相对笔刷半径（羽化范围）
 
     // —— 捏合判定 ——
-    pinchClose: 0.055,      // 指尖归一化距离 < 此值 ⇒ 捏合（落笔）
-    pinchOpen: 0.075,       // 指尖归一化距离 > 此值 ⇒ 松开（抬笔）—— 滞回防抖
+    pinchClose: 0.070,      // 指尖归一化距离 < 此值 ⇒ 捏合（落笔）
+    pinchOpen: 0.100,       // 指尖归一化距离 > 此值 ⇒ 松开（抬笔）—— 滞回防抖
 
     // —— 平滑 / 性能 ——
     smoothing: 0.45,        // 指尖坐标指数平滑系数（越小越顺滑、越滞后）
@@ -245,6 +256,7 @@
   const progressNum= document.getElementById('progressNum');
   const resetBtn   = document.getElementById('resetBtn');
   const brushRange = document.getElementById('brushRange');
+  const sensRange  = document.getElementById('sensRange');
 
   const fctx = fogCanvas.getContext('2d');               // 雾气层
 
@@ -257,6 +269,7 @@
   let pinching    = false;   // 是否处于捏合（落笔）状态
   let tip         = null;    // 平滑后的指尖屏幕坐标 {x, y}
   let lastStamp   = null;    // 上一枚印章的位置（用于插值连线）
+  let pinchScale  = 1;       // 捏合灵敏度倍率（底部「灵敏」滑杆，1 = 标准）
 
   /* =========================================================================
    * 3. 笔刷印章（预渲染成离屏画布，绘制时只做 drawImage，性能好）
@@ -464,6 +477,7 @@
       pinching = false;
       tip = null;
       lastStamp = null;
+      syncHud();
       return;
     }
 
@@ -483,12 +497,15 @@
     }
 
     // —— 捏合判定：归一化欧氏距离 + 滞回，避免在阈值附近抖动 ——
+    // 阈值受「灵敏」滑杆缩放：倍率越大越容易触发
     const pinchDist = Math.hypot(thumbTip.x - indexTip.x, thumbTip.y - indexTip.y);
-    if (!pinching && pinchDist < CFG.pinchClose)      pinching = true;
-    else if (pinching && pinchDist > CFG.pinchOpen)   pinching = false;
+    if (!pinching && pinchDist < CFG.pinchClose * pinchScale)     pinching = true;
+    else if (pinching && pinchDist > CFG.pinchOpen * pinchScale)  pinching = false;
 
     if (pinching) drawStroke();
     else          lastStamp = null;                // 抬笔：断开笔画，下次重新起笔
+
+    syncHud();                                     // 状态即时刷新，不等定时器
   }
 
   /** 落笔：把当前指尖位置连到上一枚印章 */
@@ -559,11 +576,13 @@
     setStatus(pinching ? '已检测到手部 · <b>捏合中</b> ✏️ 除雾笔已落笔'
                        : '已检测到手部 · 松开（抬笔）');
   }
-  setInterval(function () {
+  /** 把状态同步到 HUD；识别每一帧都会调用，另有定时器兜底 */
+  function syncHud() {
     refreshStatus();
     document.body.classList.toggle('is-hand',  handPresent);
     document.body.classList.toggle('is-pinch', handPresent && pinching);
-  }, 120);
+  }
+  setInterval(syncHud, 200);
 
   /* =========================================================================
    * 11. 主帧循环（requestAnimationFrame）
@@ -581,10 +600,80 @@
   let camera = null;
   let manualStream = null;
 
+  /* ---------------------------------------------------------------------
+   * CDN 线路：动态加载脚本 + 超时 + 多线路自动回退。
+   * 顺序按通用性排，第一条不通就自动换下一条，最终保证不会无限等待。
+   * ------------------------------------------------------------------ */
+  const MP_VERSIONS = {
+    '@mediapipe/hands': '0.4.1675469240',
+    '@mediapipe/camera_utils': '0.3.1675466862'
+  };
+  const CDNS = [
+    { name: 'jsDelivr', url: function (pkg, f) {
+        return 'https://cdn.jsdelivr.net/npm/' + pkg + '/' + f; } },
+    { name: 'npmmirror', url: function (pkg, f) {
+        return 'https://registry.npmmirror.com/' + pkg + '/' + MP_VERSIONS[pkg] + '/files/' + f; } },
+    { name: 'Fastly', url: function (pkg, f) {
+        return 'https://fastly.jsdelivr.net/npm/' + pkg + '/' + f; } },
+    { name: 'unpkg', url: function (pkg, f) {
+        return 'https://unpkg.com/' + pkg + '/' + f; } }
+  ];
+  const CDN_TIMEOUT  = 8000;    // 单条线路最长等待
+  const INIT_TIMEOUT = 45000;   // 模型初始化（wasm）最长等待
+  let activeCdn = CDNS[0];
+
+  /** 动态插入脚本；超时或加载失败都会 reject，不会拖住页面 */
+  function loadScript(url, timeoutMs) {
+    return new Promise(function (resolve, reject) {
+      const s = document.createElement('script');
+      let settled = false;
+      const timer = setTimeout(function () {
+        if (settled) return;
+        settled = true; s.remove(); reject(new Error('timeout'));
+      }, timeoutMs);
+      s.onload  = function () { if (settled) return; settled = true; clearTimeout(timer); resolve(); };
+      s.onerror = function () { if (settled) return; settled = true; clearTimeout(timer); s.remove(); reject(new Error('error')); };
+      s.src = url;
+      document.head.appendChild(s);
+    });
+  }
+
+  function withTimeout(promise, ms, message) {
+    return Promise.race([
+      promise,
+      new Promise(function (_, reject) { setTimeout(function () { reject(new Error(message)); }, ms); })
+    ]);
+  }
+
+  /** 依次尝试各条线路，成功后记录当前线路，后续 wasm/模型也从它下载 */
+  async function loadMediaPipe() {
+    for (let i = 0; i < CDNS.length; i++) {
+      const cdn = CDNS[i];
+      overlayText.textContent = '正在加载手部识别模型…（线路 ' + (i + 1) + '/' + CDNS.length + '：' + cdn.name + '）';
+      try {
+        if (typeof Hands === 'undefined') {
+          await loadScript(cdn.url('@mediapipe/hands', 'hands.js'), CDN_TIMEOUT);
+        }
+        if (typeof Camera === 'undefined') {
+          await loadScript(cdn.url('@mediapipe/camera_utils', 'camera_utils.js'), CDN_TIMEOUT);
+        }
+        if (typeof Hands === 'undefined') throw new Error('Hands not registered');
+        activeCdn = cdn;
+        return;
+      } catch (e) {
+        /* 这条线路不通，换下一条 */
+      }
+    }
+    throw new Error('CDN_FAILED');
+  }
+
   function showError(title, message) {
     card.classList.add('error');
-    card.innerHTML = '<div class="spinner"></div><h1>' + title + '</h1><p>' + message + '</p>';
+    card.innerHTML = '<div class="spinner"></div><h1>' + title + '</h1><p>' + message + '</p>' +
+                     '<button id="retryBtn" type="button">重新尝试</button>';
     overlay.classList.remove('hidden');
+    const rb = document.getElementById('retryBtn');
+    if (rb) rb.addEventListener('click', function () { location.reload(); });
   }
 
   function hideOverlay() {
@@ -606,12 +695,9 @@
   }
 
   async function initHands() {
-    if (typeof Hands === 'undefined') {
-      throw new Error('MediaPipe Hands 脚本未加载，请检查网络或 CDN 是否可用。');
-    }
     hands = new Hands({
       locateFile: function (file) {
-        return 'https://cdn.jsdelivr.net/npm/@mediapipe/hands/' + file;
+        return activeCdn.url('@mediapipe/hands', file);
       }
     });
     hands.setOptions({
@@ -621,7 +707,8 @@
       minTrackingConfidence: 0.55
     });
     hands.onResults(onResults);
-    await hands.initialize();       // 预加载 wasm + 模型
+    // 预加载 wasm + 模型；加超时，避免卡死在转圈界面
+    await withTimeout(hands.initialize(), INIT_TIMEOUT, 'INIT_TIMEOUT');
   }
 
   async function startCamera() {
@@ -663,6 +750,8 @@
       if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
         throw new Error('NO_CAMERA_API');
       }
+      await loadMediaPipe();
+      overlayText.textContent = '模型加载完成，正在初始化…';
       await initHands();
       overlayText.textContent = '模型就绪，正在开启摄像头…';
       await startCamera();
@@ -677,9 +766,21 @@
       let title = '启动失败';
       let msg = String((err && err.message) || err);
 
-      if (err && err.message === 'NO_CAMERA_API' || (err && err.name === 'NotAllowedError')) {
+      if (msg === 'CDN_FAILED') {
+        title = '无法下载手部识别模型';
+        msg = '四条 CDN 线路都没有连上，通常是网络或代理把 <code>cdn.jsdelivr.net</code> ' +
+              '这类域名拦住了。<br><br>换一个网络（或开启代理）后点下面的按钮重试。';
+      } else if (msg === 'INIT_TIMEOUT') {
+        title = '模型初始化超时';
+        msg = '模型文件已经下载，但初始化没有完成。常见原因是浏览器关闭了硬件加速（WebGL）。' +
+              '<br><br>请在浏览器设置里开启「使用硬件加速」后重启浏览器再试。';
+      } else if (msg === 'NO_CAMERA_API' || (err && err.name === 'NotAllowedError')) {
         title = '无法访问摄像头';
         msg = '请检查浏览器权限设置，允许本站使用摄像头后刷新页面。';
+      } else if (err && (err.name === 'NotReadableError' || /device in use/i.test(msg))) {
+        title = '摄像头被其他程序占用';
+        msg = '摄像头正被另一个标签页或应用使用（微信、腾讯会议、相机等）。' +
+              '<br><br>把占用摄像头的窗口关掉，再点下面的按钮重试。';
       } else if (err && err.name === 'NotFoundError') {
         title = '未找到摄像头';
         msg = '请确认设备已连接摄像头（或已开启虚拟摄像头）后刷新页面。';
@@ -703,6 +804,11 @@
   brushRange.addEventListener('input', function () {
     CFG.brushScale = Number(this.value) / 1000;
     updateBrushRadius();
+  });
+
+  // 滑杆值 60~200 ⇒ 捏合阈值倍率 0.6~2.0（默认 100 ⇒ 1.0，越大越容易触发）
+  sensRange.addEventListener('input', function () {
+    pinchScale = Number(this.value) / 100;
   });
 
   resetBtn.addEventListener('click', function () {
